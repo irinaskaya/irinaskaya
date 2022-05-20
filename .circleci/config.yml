@@ -213,16 +213,6 @@ workflows:
       - pytest:
           requires:
             - checkout
-      - generate-notebook-source:
-          context: 'Generate notebook source files'
-          filters:
-            branches:
-              ignore:
-                - master
-                - /staging-.*/
-                - release
-          requires:
-            - checkout
       - build-markdown-azure:
           filters:
             branches:
