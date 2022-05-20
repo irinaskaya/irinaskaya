@@ -1,30 +1,305 @@
-version: 2
-jobs: # we now have TWO jobs, so that a workflow can coordinate them!
-  one: # This is our first job.
-    docker: # it uses the docker executor
-      - image: cimg/ruby:2.6.8 # specifically, a docker image with ruby 2.6.8
-        auth:
-          username: mydockerhub-user
-          password: $DOCKERHUB_PASSWORD  # context / project UI env-var reference
-    # Steps are a list of commands to run inside the docker container above.
+version: 2.1
+commands:
+  build-docs:
+    parameters:
+      target:
+        type: string
     steps:
-      - checkout # this pulls code down from GitHub
-      - run: echo "A first hello" # This prints "A first hello" to stdout.
-      - run: sleep 25 # a command telling the job to "sleep" for 25 seconds.
-  two: # This is our second job.
-    docker: # it runs inside a docker image, the same as above.
-      - image: cimg/ruby:3.0.2
-        auth:
-          username: mydockerhub-user
-          password: $DOCKERHUB_PASSWORD  # context / project UI env-var reference
+      - run: echo bazel build //:<<parameters.target>>
+  clean-and-compress:
+    parameters:
+      cloud:
+        type: string
+      output:
+        type: string
+      target:
+        type: string
+    steps:
+      - attach_workspace:
+          at: '.'
+      - build-docs:
+          target: <<parameters.target>>
+      - run: echo python3 redocify.py <<parameters.cloud>> circleci
+      - run: echo rm -rfv bazel-genfiles/final-<<parameters.output>>-output-<<parameters.cloud>>/<<parameters.output>>/{.doctrees,shared,_sources}/
+      - run: echo tar zcf artifacts-doc-<<parameters.output>>-<<parameters.cloud>>.tar.gz bazel-genfiles/final-<<parameters.output>>-output-<<parameters.cloud>>/<<parameters.output>>/
+      - store_artifacts:
+          path: artifacts-doc-<<parameters.output>>-<<parameters.cloud>>.tar.gz
+      - persist_to_workspace:
+          root: '.'
+          paths:
+            - 'bazel-genfiles/final-<<parameters.output>>-output-<<parameters.cloud>>/<<parameters.output>>/*'
+            - 'set-redirects.py'
+  lint-and-image-size:
+    steps:
+      - run: echo mkdir -pv results/
+      - run: echo mkdir -pv logs/
+      - run: echo pytest -k image_size --junit-xml results/image-size.xml shared/tests/ || true
+      - run: echo pytest -k lint --junit-xml results/lint.xml shared/tests/ || true
+      - store_test_results:
+          path: results/
+      - store_artifacts:
+          path: /Users/Irina.Klepatskaya/logs/
+  prep-aws:
+    steps:
+      - run: echo aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+      - run: echo aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+      - run: echo aws configure set default.region us-west-2
+  publish-html:
+    parameters:
+      bucket_name_var:
+        type: string
+      cloud:
+        type: string
+      dist_id_var:
+        type: string
+    steps:
+      - attach_workspace:
+          at: '.'
+      - run: echo python3 redocify.py <<parameters.cloud>> circleci
+      - prep-aws
+      - run: echo aws s3 sync --delete bazel-genfiles/final-html-output-<<parameters.cloud>>/html/ s3://${<<parameters.bucket_name_var>>}
+      - run: echo pip install --user boto3
+      - run: echo python3 set-redirects.py ${<<parameters.bucket_name_var>>} redirects-<<parameters.cloud>>.xml
+      - run: echo aws cloudfront create-invalidation --distribution-id ${<<parameters.dist_id_var>>} --paths "/*"
+executors:
+  bazel:
+    docker:
+      - image: databricksdocs/bazel:v0.0.7
+  python:
+    docker:
+      - image: databricksdocs/sphinx:v0.0.6
+  awscli:
+    docker:
+      - image: databricksdocs/aws-cli:v0.0.3
+  pytest:
+    docker:
+      - image: databricksdocs/pytest:v0.2.5
+jobs:
+  checkout:
+    executor: python
     steps:
       - checkout
-      - run: echo "A more familiar hi" # We run a similar echo command to above.
-      - run: sleep 15 # and then sleep for 15 seconds.
-# Under the workflows: map, we can coordinate our two jobs, defined above.
+      - add_ssh_keys:
+          fingerprints:
+            - "d9:8d:19:76:7e:dd:63:21:e9:36:a9:9d:cd:73:e1:99"
+      - run:
+          name: Update submodules
+          command: git submodule update --init
+      - persist_to_workspace:
+          root: '.'
+          paths:
+            - '.'
+  lint:
+    executor: bazel
+    steps:
+      - attach_workspace:
+          at: '.'
+      - run: echo bazel test //:all
+      - run: echo rm -rfv bazel-genfiles/final-{html,msmd}-output-{aws,gcp,azure}/{html,msmd}/{shared,_sources,.doctrees}
+      - run: echo tar zcf output.tar.gz bazel-genfiles/* bazel-testlogs/*
+      - store_artifacts:
+          path: output.tar.gz
+      - persist_to_workspace:
+          root: '.'
+          paths:
+            - 'bazel-genfiles/*'
+            - 'bazel-testlogs/*'
+            - 'set-redirects.py'
+  build-markdown-azure:
+    executor: bazel
+    steps:
+      - clean-and-compress:
+          cloud: azure
+          output: msmd
+          target: markdown-azure
+      - lint-and-image-size
+  build-html-gcp:
+    executor: bazel
+    steps:
+      - clean-and-compress:
+          cloud: gcp
+          output: html
+          target: docs-gcp
+      - lint-and-image-size
+  build-html-aws:
+    executor: bazel
+    steps:
+      - clean-and-compress:
+          cloud: aws
+          output: html
+          target: docs-aws
+      - lint-and-image-size
+  build-html-azure:
+    executor: bazel
+    steps:
+      - clean-and-compress:
+          cloud: azure
+          output: html
+          target: docs-azure
+      - lint-and-image-size
+  publish-markdown-azure:
+    executor: python
+    steps:
+      - attach_workspace:
+          at: '.'
+      - add_ssh_keys:
+          fingerprints:
+            - "d9:8d:19:76:7e:dd:63:21:e9:36:a9:9d:cd:73:e1:99"
+      - run:
+          name: Add Authorized Keys
+          command: echo ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - run:
+          name: Publish
+          command: echo python .circleci/publish.py databricks azure-databricks-docs docs ${DB_DOCS_CI_TOKEN} ${CIRCLE_SHA1} bazel-genfiles/final-msmd-output-azure/msmd/
+  publish-html-aws:
+    executor: awscli
+    steps:
+      - publish-html:
+          bucket_name_var: AWS_BUCKET_NAME_DOCS
+          cloud: aws
+          dist_id_var: AWS_DISTRIBUTION_ID_DOCS
+  publish-html-gcp:
+    executor: awscli
+    steps:
+      - publish-html:
+          bucket_name_var: AWS_BUCKET_NAME_DOCS
+          cloud: gcp
+          dist_id_var: AWS_DISTRIBUTION_ID_DOCS
+  publish-html-azure:
+    executor: awscli
+    steps:
+      - publish-html:
+          bucket_name_var: AWS_BUCKET_NAME_DOCS_AZURE
+          cloud: azure
+          dist_id_var: AWS_DISTRIBUTION_ID_DOCS_AZURE
+  generate-notebook-source:
+    executor: python
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "d9:8d:19:76:7e:dd:63:21:e9:36:a9:9d:cd:73:e1:99"
+      - attach_workspace:
+          at: '.'
+      - run: echo sudo pip3 install -U pip
+      - run: echo sudo pip install databricks-cli==0.9.1 click==7.1.1
+      - run: echo bin/nb-databricks-config.sh
+      - run: echo bin/nb-set-env-vars.sh
+      - run: echo bin/nb-find-updated.sh
+      - run: echo bin/nb-gen-nb-src.sh
+      - run: echo mkdir -p ~/.ssh/ && echo -e "Host github.com\n\tStrictHostKeyChecking no\n" > ~/.ssh/config
+      - run: echo bin/nb-commit-back.sh
+  pytest:
+    description: "Run pytest and store results"
+    executor: pytest
+    steps:
+      - attach_workspace:
+          at: '.'
+      - run: echo pytest || true
+      - run: echo pylint --output=results/pylint.xml */**/*.py --exit-zero
+      - store_test_results:
+          path: results/
+      - store_artifacts:
+          path: results/
 workflows:
-  version: 2
-  one_and_two: # this is the name of our workflow
-    jobs: # and here we list the jobs we are going to run.
-      - one
-      - two
+  build-and-publish:
+    jobs:
+      - checkout
+      - lint:
+          filters:
+            branches:
+              only: release
+          requires:
+            - checkout
+      - pytest:
+          requires:
+            - checkout
+      - generate-notebook-source:
+          context: 'Generate notebook source files'
+          filters:
+            branches:
+              ignore:
+                - master
+                - /staging-.*/
+                - release
+          requires:
+            - checkout
+      - build-markdown-azure:
+          filters:
+            branches:
+              ignore:
+                - /staging-.*/
+          requires:
+            - checkout
+            - generate-notebook-source
+      - build-html-aws:
+          filters:
+            branches:
+              ignore:
+                - staging-azure
+                - staging-gcp
+          requires:
+            - checkout
+            - generate-notebook-source
+      - build-html-gcp:
+          filters:
+            branches:
+              ignore:
+                - staging-aws
+                - staging-azure
+          requires:
+            - checkout
+            - generate-notebook-source
+      - build-html-azure:
+          filters:
+            branches:
+              ignore:
+                - release
+                - staging-aws
+                - staging-gcp
+          requires:
+            - checkout
+            - generate-notebook-source
+      # publishing steps
+      - publish-markdown-azure:
+          context: 'Azure Databricks Docs'
+          filters:
+            branches:
+              only: release
+          requires:
+            - build-markdown-azure
+      - publish-html-aws:
+          context: 'AWS Databricks Docs Release'
+          filters:
+            branches:
+              only: release
+          requires:
+            - build-html-aws
+      - publish-html-aws:
+          context: 'AWS Databricks Docs Staging'
+          filters:
+            branches:
+              only: staging-aws
+          requires:
+            - build-html-aws
+      - publish-html-gcp:
+          context: 'GCP Databricks Docs Release'
+          filters:
+            branches:
+              only: release
+          requires:
+            - build-html-gcp
+      - publish-html-gcp:
+          context: 'GCP Databricks Docs Staging'
+          filters:
+            branches:
+              only: staging-gcp
+          requires:
+            - build-html-gcp
+      - publish-html-azure:
+          context: 'AWS Databricks Docs Staging'
+          filters:
+            branches:
+              only: 
+                - staging-azure
+          requires:
+            - build-html-azure
